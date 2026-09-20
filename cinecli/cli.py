@@ -1,20 +1,21 @@
 import typer
-from rich.prompt import Prompt
 from rich.console import Console
-from cinecli.config import load_config
 
-from cinecli.api import search_movies, get_movie_details
-from cinecli.ui import (
-    show_movies,
-    show_movie_details,
-    show_torrents,
+from cinecli.api import search_movies
+from cinecli.config import ConfigError, load_config
+from cinecli.magnets import build_delivery_backend
+from cinecli.session import (
+    BrowseToLaunchSession,
+    InvalidSelection,
+    MovieIdEntry,
+    PromptCancelled,
+    RichPromptAdapter,
+    SearchSelectionEntry,
+    SessionResult,
+    SessionStatus,
+    validate_index,
 )
-from cinecli.magnets import (
-    build_magnet,
-    open_magnet,
-    download_torrent,
-    select_best_torrent,
-)
+from cinecli.ui import render_session_result, show_movies
 
 # -------------------------------------------------
 # App + Console
@@ -23,9 +24,37 @@ from cinecli.magnets import (
 app = typer.Typer(
     help="🎬 CineCLI — Browse and torrent movies from your terminal",
 )
-config = load_config()
 
 console = Console()
+
+# -------------------------------------------------
+# Shared wiring
+# -------------------------------------------------
+
+def _run_browse_session(entry) -> None:
+    """Assemble a session with freshly validated, explicitly injected
+    dependencies, render its terminal state and apply one exit-code
+    mapping for every entry point."""
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        console.print(f"[red]❌ Invalid configuration: {exc}[/red]")
+        raise typer.Exit(code=2)
+
+    session = BrowseToLaunchSession(
+        config=config,
+        prompter=RichPromptAdapter(),
+        delivery=build_delivery_backend(config.transmission),
+    )
+
+    _finish(session.run(entry))
+
+
+def _finish(result: SessionResult) -> None:
+    render_session_result(result)
+    if result.exit_code:
+        raise typer.Exit(code=result.exit_code)
+
 
 # -------------------------------------------------
 # Search command
@@ -39,7 +68,6 @@ def search(
     search_query = " ".join(query)
     movies = search_movies(search_query, limit)
 
-
     if not movies:
         console.print("[red]❌ No movies found.[/red]")
         raise typer.Exit(code=1)
@@ -47,7 +75,7 @@ def search(
     show_movies(movies)
 
 # -------------------------------------------------
-# Watch command
+# Watch command — enters the session from a movie id
 # -------------------------------------------------
 
 @app.command()
@@ -55,60 +83,10 @@ def watch(movie_id: int):
     """
     View movie details and open torrent (magnet or .torrent file)
     """
-    movie = get_movie_details(movie_id)
+    _run_browse_session(MovieIdEntry(movie_id=movie_id))
 
-    show_movie_details(movie)
-
-    torrents = movie.get("torrents", [])
-    if not torrents:
-        console.print("[red]❌ No torrents available.[/red]")
-        raise typer.Exit(code=1)
-
-    show_torrents(torrents)
-    auto = typer.confirm("🎯 Auto-select best torrent?", default=True)
-
-    if auto:
-        torrent = select_best_torrent(torrents)
-        typer.echo(
-            f"🎯 Auto-selected torrent: {torrent['quality']} ({torrent['size']})"
-        )
-    else:
-        index = typer.prompt(
-            "Select torrent index",
-            type=int
-        )
-
-        if index < 0 or index >= len(torrents):
-            typer.echo("❌ Invalid torrent index")
-            raise typer.Exit(code=1)
-
-        torrent = torrents[index]
-
-
-
-    default_action = config.get("default_action", "magnet")
-    transmission = config.get("transmission", {})
-    open_method = "Transmission client" if transmission.get("enable", False) else "web browser"
-
-    action = Prompt.ask(
-        "Choose action",
-        choices=["magnet", "torrent"],
-        default=default_action,
-    )
-
-
-    if action == "magnet":
-        magnet = build_magnet(
-            torrent["hash"],
-            f"{movie['title']} {torrent['quality']}",
-        )
-        open_magnet(magnet, transmission)
-        console.print(f"[green]🧲 Magnet link opened in your {open_method}![/green]")
-    else:
-        download_torrent(torrent["url"], transmission)
-        console.print(f"[green]⬇ Torrent file download started in your {open_method}.[/green]")
 # -------------------------------------------------
-# Interactive command
+# Interactive command — enters from a search selection
 # -------------------------------------------------
 
 @app.command()
@@ -116,58 +94,28 @@ def interactive():
     """
     Interactive movie browser (search → select → torrent)
     """
-    query = Prompt.ask("🔍 Search movies")
+    prompter = RichPromptAdapter()
+
+    try:
+        query = prompter.ask_search_query()
+    except PromptCancelled:
+        _finish(SessionResult(status=SessionStatus.CANCELLED))
+        return
 
     movies = search_movies(query, limit=10)
     if not movies:
         console.print("[red]❌ No movies found.[/red]")
-        raise typer.Exit()
+        raise typer.Exit(code=1)
 
-    # Show movie list
-    for idx, movie in enumerate(movies):
-        console.print(
-            f"[cyan][{idx}][/cyan] "
-            f"{movie['title']} ({movie['year']}) "
-        )
+    show_movies(movies)
 
-    movie_index = Prompt.ask(
-        "Select movie index",
-        choices=[str(i) for i in range(len(movies))]
-    )
+    try:
+        index = validate_index(prompter.choose_movie_index(len(movies)), len(movies))
+    except PromptCancelled:
+        _finish(SessionResult(status=SessionStatus.CANCELLED))
+        return
+    except InvalidSelection:
+        _finish(SessionResult(status=SessionStatus.INVALID_SELECTION))
+        return
 
-    movie_id = movies[int(movie_index)]["id"]
-
-    movie = get_movie_details(movie_id)
-    show_movie_details(movie)
-
-    torrents = movie.get("torrents", [])
-    if not torrents:
-        console.print("[red]❌ No torrents available.[/red]")
-        raise typer.Exit()
-
-    show_torrents(torrents)
-
-    torrent_index = Prompt.ask(
-        "Select torrent index",
-        choices=[str(i) for i in range(len(torrents))]
-    )
-
-    torrent = torrents[int(torrent_index)]
-
-    action = Prompt.ask(
-        "Choose action",
-        choices=["magnet", "torrent"],
-        default="magnet"
-    )
-
-    if action == "magnet":
-        magnet = build_magnet(
-            torrent["hash"],
-            f"{movie['title']} {torrent['quality']}"
-        )
-        open_magnet(magnet)
-        console.print("[green]🧲 Magnet opened in torrent client![/green]")
-    else:
-        download_torrent(torrent["url"])
-        console.print("[green]⬇ Torrent file download started.[/green]")
-
+    _run_browse_session(SearchSelectionEntry(movie=movies[index]))

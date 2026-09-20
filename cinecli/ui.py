@@ -2,8 +2,10 @@
 
 from rich.table import Table
 from rich.console import Console
+from rich.panel import Panel
 
 console = Console()
+
 
 def show_movies(movies):
     table = Table(title="🎬 Search Results")
@@ -21,7 +23,6 @@ def show_movies(movies):
 
     console.print(table)
 
-from rich.panel import Panel
 
 def show_movie_details(movie):
     description = (
@@ -57,3 +58,38 @@ def show_torrents(torrents):
         )
 
     console.print(table)
+
+
+def show_auto_selected(torrent):
+    console.print(
+        f"🎯 Auto-selected torrent: {torrent['quality']} ({torrent['size']})"
+    )
+
+
+def render_session_result(result):
+    """Render a session's terminal state. Imported lazily to avoid a
+    session <-> ui import cycle (session drives the ui views)."""
+    from cinecli.session import SessionStatus
+
+    if result.status is SessionStatus.DELIVERED:
+        if result.action == "magnet":
+            console.print(
+                f"[green]🧲 Magnet link opened in your "
+                f"{result.backend_label}![/green]"
+            )
+        else:
+            console.print(
+                f"[green]⬇ Torrent file download started in your "
+                f"{result.backend_label}.[/green]"
+            )
+    elif result.status is SessionStatus.NO_TORRENTS:
+        console.print("[red]❌ No torrents available.[/red]")
+    elif result.status is SessionStatus.CANCELLED:
+        console.print("[yellow]⚠ Operation cancelled.[/yellow]")
+    elif result.status is SessionStatus.INVALID_SELECTION:
+        console.print("[red]❌ Invalid selection.[/red]")
+    elif result.status is SessionStatus.DELIVERY_FAILED:
+        console.print(
+            f"[red]❌ Failed to deliver to {result.backend_label}: "
+            f"{result.error}[/red]"
+        )
